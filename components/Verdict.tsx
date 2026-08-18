@@ -62,6 +62,9 @@ export function Legend() {
         </span>
       ))}
       <span className="text-[var(--muted)]">Hover any cell to read the quoted evidence.</span>
+      <span className="text-[var(--muted)]">
+        Click a candidate&rsquo;s name to see full evidence.
+      </span>
     </div>
   );
 }

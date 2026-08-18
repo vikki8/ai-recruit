@@ -6,6 +6,8 @@
   --foreground: #0f172a;
   --muted: #64748b;
   --border: #e2e8f0;
+  --link: #1d4ed8;
+  --link-hover: #1e3a8a;
 }
 
 @theme inline {
@@ -23,4 +25,33 @@ body {
   background: var(--background);
   color: var(--foreground);
   font-family: var(--font-sans);
+}
+
+/*
+ * Candidate names in the comparison grid head. They were already links but read as
+ * plain headings, so nobody clicked them. Pure CSS: the chevron is a ::after
+ * pseudo-element, and there is no transition.
+ */
+.candidate-link {
+  color: var(--link);
+  cursor: pointer;
+  text-decoration: none;
+}
+
+.candidate-link::after {
+  content: "\203A"; /* single right-pointing angle quotation mark */
+  margin-left: 0.25rem;
+  font-weight: 400;
+  text-decoration: none;
+}
+
+.candidate-link:hover {
+  color: var(--link-hover);
+  text-decoration: underline;
+}
+
+.candidate-link:focus-visible {
+  outline: 2px solid var(--link);
+  outline-offset: 2px;
+  border-radius: 2px;
 }

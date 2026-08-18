@@ -40,7 +40,7 @@ export function ComparisonGrid({
               >
                 <Link
                   href={`/candidates/${standing.candidateId}`}
-                  className="block font-semibold hover:underline"
+                  className="candidate-link block font-semibold"
                 >
                   {standing.name}
                 </Link>
