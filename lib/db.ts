@@ -124,6 +124,22 @@ export async function insertRequirements(
   );
 }
 
+export async function addRequirement(
+  jobId: string,
+  text: string,
+  kind: RequirementKind,
+): Promise<Requirement> {
+  const existing = await getRequirements(jobId);
+  const nextOrder = existing.reduce((max, r) => Math.max(max, r.sort_order), -1) + 1;
+  return unwrap(
+    await supabase()
+      .from("requirements")
+      .insert({ job_id: jobId, text, kind, sort_order: nextOrder })
+      .select("*")
+      .single(),
+  );
+}
+
 export async function updateRequirement(
   id: string,
   patch: { text?: string; kind?: RequirementKind },
