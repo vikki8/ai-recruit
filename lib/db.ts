@@ -94,6 +94,16 @@ export async function getRequirements(jobId: string): Promise<Requirement[]> {
   return data ?? [];
 }
 
+export async function getRequirement(id: string): Promise<Requirement | null> {
+  const { data, error } = await supabase()
+    .from("requirements")
+    .select("*")
+    .eq("id", id)
+    .maybeSingle();
+  if (error) throw new Error(error.message);
+  return data;
+}
+
 export async function insertRequirements(
   jobId: string,
   requirements: Array<{ text: string; kind: RequirementKind }>,
