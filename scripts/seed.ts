@@ -1,20 +1,23 @@
 import { randomUUID } from "node:crypto";
 import { readFileSync } from "node:fs";
-import { validateEvaluations, type RequirementRef } from "../lib/evidence";
+import { evaluateCandidate } from "../lib/ai";
+import { validateEvaluations, type ModelResult, type RequirementRef } from "../lib/evidence";
 import { SEED_CANDIDATES, SEED_JOB, SEED_REQUIREMENTS } from "../lib/seed-data";
 
 /**
  * Seeds the demo job and its six candidates.
  *
- *   npm run seed           write to Supabase using SUPABASE_SERVICE_ROLE_KEY
- *   npm run seed -- --sql  print the equivalent SQL instead of writing
+ *   npm run seed                write to Supabase using SUPABASE_SERVICE_ROLE_KEY
+ *   npm run seed -- --sql       print the equivalent SQL instead of writing
+ *   npm run seed -- --evaluate  regenerate the verdicts with real AI calls
  *
- * The fixtures are hand-authored, but they are put through the same validator the live
- * path uses. If a quote does not appear in its CV the seed fails rather than silently
- * writing a gap, so the demo data can never drift from what the app would produce.
+ * The committed fixtures are hand-authored, but they are put through the same validator
+ * the live path uses. If a quote does not appear in its CV the seed fails rather than
+ * silently writing a gap, so the demo data can never drift from what the app produces.
  *
- * A --evaluate mode that regenerates these through a real AI run is intentionally not
- * implemented; see the README for why.
+ * --evaluate exists so the fixtures can be refreshed against a real model run, but the
+ * shipped demo data is the hand-authored set: it is free, instant, reproducible, and one
+ * candidate deliberately carries an unsupported claim to show the guardrail working.
  */
 
 function loadEnv() {
@@ -42,7 +45,7 @@ type Row = {
   downgradeReason: string | null;
 };
 
-function buildPlan() {
+async function buildPlan(useAi: boolean) {
   const jobId = randomUUID();
 
   const requirements = SEED_REQUIREMENTS.map((r, i) => ({
@@ -68,19 +71,31 @@ function buildPlan() {
     const id = randomUUID();
     candidates.push({ id, name: seed.name, cvText: seed.cvText });
 
-    const validated = validateEvaluations(seed.cvText, refs, seed.results);
+    let results: ModelResult[] = seed.results;
+    if (useAi) {
+      console.log(`  evaluating ${seed.name} with the model...`);
+      const response = await evaluateCandidate(
+        seed.cvText,
+        refs.map((r) => ({ handle: r.handle, text: r.text, kind: r.kind })),
+      );
+      results = response.results;
+    }
+
+    const validated = validateEvaluations(seed.cvText, refs, results);
 
     validated.forEach((row, i) => {
       const authored = seed.results[i];
       const wasDowngraded = row.downgradeReason !== null;
 
-      if (wasDowngraded && !authored.unsupported) {
+      // The fixture assertions only apply to the hand-authored set. A real model run is
+      // allowed to produce downgrades; that is the guardrail doing its job, not a bug.
+      if (!useAi && wasDowngraded && !authored.unsupported) {
         throw new Error(
           `Seed fixture is wrong: ${seed.name} / ${authored.id} was downgraded ` +
             `(${row.downgradeReason}). Its quote does not appear in the CV text.`,
         );
       }
-      if (authored.unsupported && !wasDowngraded) {
+      if (!useAi && authored.unsupported && !wasDowngraded) {
         throw new Error(
           `Seed fixture is wrong: ${seed.name} / ${authored.id} is marked unsupported ` +
             `but the validator accepted it.`,
@@ -102,7 +117,7 @@ function buildPlan() {
   return { jobId, requirements, candidates, evaluations, downgraded };
 }
 
-function toSql(plan: ReturnType<typeof buildPlan>): string {
+function toSql(plan: Awaited<ReturnType<typeof buildPlan>>): string {
   const lines: string[] = [
     "begin;",
     "delete from public.jobs;",
@@ -134,7 +149,7 @@ function toSql(plan: ReturnType<typeof buildPlan>): string {
   return lines.join("\n");
 }
 
-async function writeToSupabase(plan: ReturnType<typeof buildPlan>) {
+async function writeToSupabase(plan: Awaited<ReturnType<typeof buildPlan>>) {
   const { createClient } = await import("@supabase/supabase-js");
 
   const url = process.env.SUPABASE_URL;
@@ -209,7 +224,10 @@ async function writeToSupabase(plan: ReturnType<typeof buildPlan>) {
 
 async function main() {
   loadEnv();
-  const plan = buildPlan();
+  const useAi = process.argv.includes("--evaluate");
+  if (useAi) console.log("Regenerating verdicts with real AI calls...");
+
+  const plan = await buildPlan(useAi);
 
   if (process.argv.includes("--sql")) {
     process.stdout.write(toSql(plan) + "\n");
