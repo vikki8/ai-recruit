@@ -22,6 +22,9 @@ export async function POST(req: Request) {
   const jobId = str(body.jobId);
   const cvText = str(body.cvText);
   const providedName = str(body.name);
+  // Set when the text came from an uploaded file via POST /api/parse. Recorded for
+  // provenance only; the original file is not stored.
+  const sourceFilename = str(body.sourceFilename) || null;
 
   if (jobId === "") return badRequest("Missing job.");
   if (cvText === "") return badRequest("Paste the candidate CV text first.");
@@ -37,7 +40,12 @@ export async function POST(req: Request) {
       return badRequest("Add at least one requirement before adding candidates.");
     }
 
-    const candidate = await createCandidate(jobId, providedName || nameFromCv(cvText), cvText);
+    const candidate = await createCandidate(
+      jobId,
+      providedName || nameFromCv(cvText),
+      cvText,
+      sourceFilename,
+    );
     candidateId = candidate.id;
 
     // Freeze the requirement set the moment the first candidate is measured against it.

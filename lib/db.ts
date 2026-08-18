@@ -34,6 +34,8 @@ export type Candidate = {
   cv_text: string;
   status: CandidateStatus;
   error_message: string | null;
+  /** Original upload filename, or null when the CV was pasted as text. */
+  source_filename: string | null;
   created_at: string;
 };
 
@@ -180,11 +182,12 @@ export async function createCandidate(
   jobId: string,
   name: string,
   cvText: string,
+  sourceFilename: string | null = null,
 ): Promise<Candidate> {
   return unwrap(
     await supabase()
       .from("candidates")
-      .insert({ job_id: jobId, name, cv_text: cvText })
+      .insert({ job_id: jobId, name, cv_text: cvText, source_filename: sourceFilename })
       .select("*")
       .single(),
   );

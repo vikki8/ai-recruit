@@ -41,7 +41,9 @@ import * as db from "@/lib/db";
 import { POST as createCandidateRoute } from "@/app/api/candidates/route";
 import { POST as draftRoute } from "@/app/api/draft/route";
 import { POST as createJobRoute } from "@/app/api/jobs/route";
+import { POST as parseRoute } from "@/app/api/parse/route";
 import { PATCH as patchRequirementRoute } from "@/app/api/requirements/[id]/route";
+import { FIXTURE_LINES, emptyPdf, sampleDocx, samplePdf } from "./cv-fixtures";
 
 const post = (url: string, body: unknown) =>
   new Request(url, {
@@ -160,6 +162,7 @@ describe("POST /api/candidates", () => {
     cv_text: CV,
     status: "pending" as const,
     error_message: null,
+    source_filename: null,
     created_at: "",
   };
 
@@ -294,6 +297,7 @@ describe("POST /api/draft", () => {
       cv_text: CV,
       status: "done",
       error_message: null,
+      source_filename: null,
       created_at: "",
     });
     vi.mocked(db.getJob).mockResolvedValue({
@@ -341,5 +345,73 @@ describe("POST /api/draft", () => {
     // The CV must never reach the drafting model.
     const args = JSON.stringify(vi.mocked(draftInvite).mock.calls[0]);
     expect(args).not.toContain("Eight years building production backend services");
+  });
+});
+
+describe("POST /api/parse", () => {
+  const upload = (filename: string, bytes: Uint8Array) => {
+    const form = new FormData();
+    form.append("file", new File([bytes as BlobPart], filename));
+    return new Request("http://t/api/parse", { method: "POST", body: form });
+  };
+
+  it("turns an uploaded PDF into text a quote can be verified against", async () => {
+    const res = await parseRoute(upload("wren_halloway_cv.pdf", samplePdf()));
+
+    expect(res.status).toBe(200);
+    const body = await res.json();
+    expect(body.name).toBe("Wren Halloway");
+    expect(body.pages).toBe(1);
+    expect(body.filename).toBe("wren_halloway_cv.pdf");
+    for (const line of FIXTURE_LINES) expect(body.text).toContain(line);
+  });
+
+  it("turns an uploaded .docx into text", async () => {
+    const res = await parseRoute(upload("wren_halloway_cv.docx", sampleDocx()));
+
+    expect(res.status).toBe(200);
+    const body = await res.json();
+    expect(body.name).toBe("Wren Halloway");
+    for (const line of FIXTURE_LINES) expect(body.text).toContain(line);
+  });
+
+  it("rejects a legacy .doc as a bad request, not a server error", async () => {
+    const res = await parseRoute(upload("cv.doc", samplePdf()));
+
+    expect(res.status).toBe(400);
+    const body = await res.json();
+    expect(body.kind).toBe("unsupported");
+    expect(body.error).toMatch(/save as \.docx/i);
+  });
+
+  it("rejects a scanned PDF with no text layer", async () => {
+    const res = await parseRoute(upload("scan.pdf", emptyPdf()));
+
+    expect(res.status).toBe(400);
+    expect((await res.json()).kind).toBe("empty");
+  });
+
+  it("rejects a corrupt PDF", async () => {
+    const res = await parseRoute(
+      upload("cv.pdf", new Uint8Array(Buffer.from("not a pdf", "utf8"))),
+    );
+
+    expect(res.status).toBe(400);
+    expect((await res.json()).kind).toBe("corrupt");
+  });
+
+  it("rejects a request with no file attached", async () => {
+    const res = await parseRoute(
+      new Request("http://t/api/parse", { method: "POST", body: new FormData() }),
+    );
+
+    expect(res.status).toBe(400);
+    expect((await res.json()).error).toMatch(/no file/i);
+  });
+
+  it("rejects a body that is not a file upload at all", async () => {
+    const res = await parseRoute(post("http://t/api/parse", { nope: true }));
+
+    expect(res.status).toBe(400);
   });
 });

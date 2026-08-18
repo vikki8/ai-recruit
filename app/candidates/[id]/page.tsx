@@ -86,6 +86,22 @@ export default async function CandidatePage({ params }: { params: Promise<{ id: 
           must-haves met &middot; {standing.niceMet} of{" "}
           {standing.niceMet + standing.nicePartial + standing.niceMissing} nice-to-haves met
         </p>
+
+        {/* Extraction quality varies by file, and a badly extracted CV produces bad
+            evaluations that look identical to a weak candidate. Showing the exact text the
+            model was given is the only way to tell those two apart. */}
+        <details className="mt-3">
+          <summary className="cursor-pointer text-xs text-[var(--muted)] hover:text-[var(--foreground)]">
+            {candidate.source_filename
+              ? `Extracted from ${candidate.source_filename}`
+              : "Pasted as text"}{" "}
+            &middot; {candidate.cv_text.length.toLocaleString()} characters &middot; view what the
+            model read
+          </summary>
+          <pre className="mt-2 max-h-80 overflow-auto rounded border border-[var(--border)] bg-[var(--surface)] p-3 font-mono text-xs leading-relaxed whitespace-pre-wrap">
+            {candidate.cv_text}
+          </pre>
+        </details>
       </div>
 
       <div className="grid gap-6 lg:grid-cols-[1.5fr_1fr]">
