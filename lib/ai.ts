@@ -1,19 +1,21 @@
-import { z } from "zod";
-import {
-  DraftResponse,
-  EvaluationResponse,
-  ExtractionResponse,
-  draftJsonSchema,
-  evaluationJsonSchema,
-  extractionJsonSchema,
-} from "./schemas";
-import { fakeDraft, fakeEvaluate, fakeExtract } from "./fake-ai";
+import Anthropic from "@anthropic-ai/sdk";
+import { zodOutputFormat } from "@anthropic-ai/sdk/helpers/zod";
+import type { z } from "zod";
+import { DraftResponse, EvaluationResponse, ExtractionResponse } from "./schemas";
 
-const DEFAULT_BASE_URL = "https://ai-gateway.vercel.sh/v1";
-const DEFAULT_MODEL = "anthropic/claude-sonnet-5";
-const TIMEOUT_MS = 25_000;
+/**
+ * The three model calls, through the official Anthropic SDK.
+ *
+ * Structured outputs (output_config.format) constrain the response to the zod schema
+ * server-side, so malformed JSON is rare rather than routine. It is still not trusted:
+ * every evaluation goes through lib/evidence.ts before anything reaches the database.
+ */
 
-export type AiErrorKind = "config" | "timeout" | "transport" | "malformed";
+const DEFAULT_MODEL = "claude-opus-5";
+const TIMEOUT_MS = 30_000;
+const MAX_TOKENS = 8000;
+
+export type AiErrorKind = "config" | "timeout" | "transport" | "malformed" | "refusal";
 
 export class AiError extends Error {
   readonly kind: AiErrorKind;
@@ -24,151 +26,81 @@ export class AiError extends Error {
   }
 }
 
-type ChatMessage = { role: "system" | "user" | "assistant"; content: string };
-type JsonSchema = { name: string; schema: unknown };
+let cached: Anthropic | null = null;
 
-function usingFakeAi(): boolean {
-  return process.env.FAKE_AI === "1";
+function client(): Anthropic {
+  if (cached) return cached;
+  const apiKey = process.env.ANTHROPIC_API_KEY;
+  if (!apiKey) throw new AiError("ANTHROPIC_API_KEY is not set.", "config");
+  cached = new Anthropic({ apiKey, maxRetries: 1, timeout: TIMEOUT_MS });
+  return cached;
 }
 
-/** One raw round trip to the OpenAI-compatible endpoint on the AI Gateway. */
-async function chat(messages: ChatMessage[], jsonSchema: JsonSchema): Promise<string> {
-  const apiKey = process.env.AI_GATEWAY_API_KEY;
-  if (!apiKey) throw new AiError("AI_GATEWAY_API_KEY is not set.", "config");
-
-  const baseUrl = process.env.AI_GATEWAY_BASE_URL || DEFAULT_BASE_URL;
-  const model = process.env.AI_MODEL || DEFAULT_MODEL;
-
-  const send = async (withResponseFormat: boolean): Promise<Response> => {
-    const controller = new AbortController();
-    const timer = setTimeout(() => controller.abort(), TIMEOUT_MS);
-    try {
-      return await fetch(`${baseUrl}/chat/completions`, {
-        method: "POST",
-        headers: {
-          "Content-Type": "application/json",
-          Authorization: `Bearer ${apiKey}`,
-        },
-        body: JSON.stringify({
-          model,
-          temperature: 0,
-          max_tokens: 8192,
-          messages,
-          ...(withResponseFormat
-            ? {
-                response_format: {
-                  type: "json_schema",
-                  json_schema: {
-                    name: jsonSchema.name,
-                    strict: true,
-                    schema: jsonSchema.schema,
-                  },
-                },
-              }
-            : {}),
-        }),
-        signal: controller.signal,
-      });
-    } catch (err) {
-      const e = err as Error;
-      if (e.name === "AbortError" || e.name === "TimeoutError") {
-        throw new AiError("The AI request timed out. Please try again.", "timeout");
-      }
-      throw new AiError(`Could not reach the AI gateway: ${e.message}`, "transport");
-    } finally {
-      clearTimeout(timer);
-    }
-  };
-
-  let res = await send(true);
-
-  // Structured-output support varies by routed provider. If the gateway rejects the
-  // response_format parameter itself, fall back to prompt-enforced JSON: the prompts
-  // already demand raw JSON and every response is validated by zod regardless.
-  if (res.status === 400) {
-    const body = await res.text();
-    if (body.includes("response_format")) {
-      res = await send(false);
-    } else {
-      throw new AiError(`AI gateway rejected the request: ${body.slice(0, 300)}`, "transport");
-    }
-  }
-
-  if (!res.ok) {
-    const body = await res.text();
-    throw new AiError(`AI gateway returned ${res.status}: ${body.slice(0, 300)}`, "transport");
-  }
-
-  const data = (await res.json()) as {
-    choices?: Array<{ message?: { content?: unknown } }>;
-  };
-  const content = data.choices?.[0]?.message?.content;
-  if (typeof content !== "string" || content.trim() === "") {
-    throw new AiError("The AI returned an empty response.", "malformed");
-  }
-  return content;
+function model(): string {
+  return process.env.AI_MODEL || DEFAULT_MODEL;
 }
 
-/** Models sometimes wrap JSON in markdown fences despite being told not to. */
-function stripFences(raw: string): string {
-  const trimmed = raw.trim();
-  if (!trimmed.startsWith("```")) return trimmed;
-  return trimmed
-    .replace(/^```(?:json)?\s*/i, "")
-    .replace(/```\s*$/, "")
-    .trim();
-}
+function toAiError(err: unknown): AiError {
+  if (err instanceof AiError) return err;
 
-function describe(err: unknown): string {
-  if (err instanceof z.ZodError) {
-    return err.issues.map((i) => `${i.path.join(".") || "root"}: ${i.message}`).join("; ");
+  if (err instanceof Anthropic.APIConnectionTimeoutError) {
+    return new AiError("The AI request timed out. Please try again.", "timeout");
   }
-  return err instanceof Error ? err.message : String(err);
+  if (err instanceof Anthropic.AuthenticationError) {
+    return new AiError("The Anthropic API key was rejected.", "config");
+  }
+  if (err instanceof Anthropic.RateLimitError) {
+    return new AiError("Rate limited by the Anthropic API. Try again shortly.", "transport");
+  }
+  if (err instanceof Anthropic.APIError) {
+    return new AiError(`Anthropic API error ${err.status}: ${err.message}`, "transport");
+  }
+  return new AiError(err instanceof Error ? err.message : String(err), "transport");
 }
 
 /**
- * Calls the model and validates the result. Exactly one repair retry on malformed
- * JSON, with the parse error fed back, then a typed error the UI can render.
+ * One structured call, with a single retry when the response cannot be parsed into the
+ * schema. After two failures the caller gets a typed error the UI renders as a state.
  */
-async function callJson<T>(
-  messages: ChatMessage[],
-  jsonSchema: JsonSchema,
-  parser: z.ZodType<T>,
+async function callStructured<T>(
+  name: string,
+  schema: z.ZodType<T>,
+  system: string,
+  user: string,
 ): Promise<T> {
-  const first = await chat(messages, jsonSchema);
-  try {
-    return parser.parse(JSON.parse(stripFences(first)));
-  } catch (firstErr) {
-    const repair: ChatMessage[] = [
-      ...messages,
-      { role: "assistant", content: first },
-      {
-        role: "user",
-        content:
-          `That response could not be parsed: ${describe(firstErr)}\n\n` +
-          `Reply again with ONLY valid JSON matching the schema. No prose, no markdown fences.`,
-      },
-    ];
-    const second = await chat(repair, jsonSchema);
-    try {
-      return parser.parse(JSON.parse(stripFences(second)));
-    } catch (secondErr) {
-      throw new AiError(
-        `The AI returned malformed JSON twice. Last error: ${describe(secondErr)}`,
-        "malformed",
-      );
+  const attempt = async (extra?: string): Promise<T | null> => {
+    const message = await client().messages.parse({
+      model: model(),
+      max_tokens: MAX_TOKENS,
+      system,
+      messages: [{ role: "user", content: extra ? `${user}\n\n${extra}` : user }],
+      output_config: { format: zodOutputFormat(schema) },
+    });
+
+    if (message.stop_reason === "refusal") {
+      throw new AiError("The model declined to answer this request.", "refusal");
     }
+    return (message.parsed_output as T | null) ?? null;
+  };
+
+  try {
+    const first = await attempt();
+    if (first !== null) return first;
+
+    const second = await attempt(
+      "Your previous response could not be parsed. Reply again with valid JSON matching the required schema exactly.",
+    );
+    if (second !== null) return second;
+
+    throw new AiError(`The AI returned an unreadable ${name} response twice.`, "malformed");
+  } catch (err) {
+    throw toAiError(err);
   }
 }
 
 /** ---------------- Call A: requirement extraction ---------------- */
 
 const EXTRACTION_SYSTEM = `You extract hiring requirements from a job description. You do not evaluate anyone.
-
-Output ONLY a JSON object. No prose, no markdown fences.
-
-Schema:
-{ "title": string, "requirements": [ { "text": string, "kind": "must_have" | "nice_to_have" } ] }
 
 Rules:
 - Each requirement is ONE atomic, checkable thing. Split compound phrases: "React and
@@ -180,30 +112,21 @@ Rules:
 - kind = "nice_to_have" when marked preferred, bonus, plus, desirable, or nice to have.
 - Return between 3 and 12 requirements.
 - If the description contains too little information to produce at least 3 requirements,
-  return { "title": "", "requirements": [] }.
+  return an empty title and an empty requirements array.
 - Never invent a requirement that the text does not support.`;
 
 export async function extractRequirements(description: string): Promise<ExtractionResponse> {
-  if (usingFakeAi()) return fakeExtract(description);
-  return callJson(
-    [
-      { role: "system", content: EXTRACTION_SYSTEM },
-      { role: "user", content: `Job description:\n\n${description}` },
-    ],
-    { name: "requirement_extraction", schema: extractionJsonSchema },
+  return callStructured(
+    "requirement_extraction",
     ExtractionResponse,
+    EXTRACTION_SYSTEM,
+    `Job description:\n\n${description}`,
   );
 }
 
 /** ---------------- Call B: candidate evaluation ---------------- */
 
 const EVALUATION_SYSTEM = `You check one candidate CV against a list of requirements. You judge evidence only. You never score, rank, compare candidates, or recommend a hiring decision.
-
-Output ONLY a JSON object. No prose, no markdown fences.
-
-Schema:
-{ "results": [ { "id": string, "verdict": "met" | "partial" | "missing",
-                 "evidence": string | null, "reasoning": string } ] }
 
 Verdicts:
 - "met":     the CV contains direct evidence the requirement is satisfied.
@@ -213,9 +136,9 @@ Verdicts:
 
 Hard rules:
 - For "met" or "partial" you MUST return "evidence": a span copied VERBATIM, character
-  for character, from the CV text below. Do not paraphrase. Do not fix typos or
-  capitalisation. Do not join separate lines. Do not add ellipses or quotation marks.
-  Copy one contiguous span.
+  for character, from the CV text. Do not paraphrase. Do not fix typos or capitalisation.
+  Do not join separate lines. Do not add ellipses or quotation marks. Copy one contiguous
+  span.
 - If you cannot copy a verbatim supporting span, the verdict is "missing" and "evidence"
   must be null. This rule is absolute.
 - Use only the CV text. Never use outside knowledge about the person, their employers, or
@@ -233,22 +156,15 @@ export async function evaluateCandidate(
   cvText: string,
   requirements: RequirementForModel[],
 ): Promise<EvaluationResponse> {
-  if (usingFakeAi()) return fakeEvaluate(cvText, requirements);
-
   const list = requirements
     .map((r) => `${r.handle}. [${r.kind === "must_have" ? "MUST" : "NICE"}] ${r.text}`)
     .join("\n");
 
-  return callJson(
-    [
-      { role: "system", content: EVALUATION_SYSTEM },
-      {
-        role: "user",
-        content: `Requirements:\n${list}\n\n--- CV TEXT BEGINS ---\n${cvText}\n--- CV TEXT ENDS ---`,
-      },
-    ],
-    { name: "candidate_evaluation", schema: evaluationJsonSchema },
+  return callStructured(
+    "candidate_evaluation",
     EvaluationResponse,
+    EVALUATION_SYSTEM,
+    `Requirements:\n${list}\n\n--- CV TEXT BEGINS ---\n${cvText}\n--- CV TEXT ENDS ---`,
   );
 }
 
@@ -257,8 +173,7 @@ export async function evaluateCandidate(
  * survived verbatim validation, so it cannot reference experience that failed the check.
  */
 
-const DRAFT_SYSTEM = `You draft a short interview invitation email. Output ONLY JSON:
-{ "subject": string, "body": string }
+const DRAFT_SYSTEM = `You draft a short interview invitation email.
 
 You are given a job title, a candidate name, and a list of requirements with the VERBATIM
 evidence lines that were verified against their CV. You are not given the CV itself.
@@ -276,21 +191,14 @@ export async function draftInvite(
   candidateName: string,
   evidence: DraftEvidence[],
 ): Promise<DraftResponse> {
-  if (usingFakeAi()) return fakeDraft(jobTitle, candidateName, evidence);
-
   const lines = evidence.length
     ? evidence.map((e) => `- ${e.requirement}\n  Verified quote: "${e.quote}"`).join("\n")
     : "(no verified evidence)";
 
-  return callJson(
-    [
-      { role: "system", content: DRAFT_SYSTEM },
-      {
-        role: "user",
-        content: `Job title: ${jobTitle}\nCandidate name: ${candidateName}\n\nVerified evidence:\n${lines}`,
-      },
-    ],
-    { name: "invite_draft", schema: draftJsonSchema },
+  return callStructured(
+    "invite_draft",
     DraftResponse,
+    DRAFT_SYSTEM,
+    `Job title: ${jobTitle}\nCandidate name: ${candidateName}\n\nVerified evidence:\n${lines}`,
   );
 }

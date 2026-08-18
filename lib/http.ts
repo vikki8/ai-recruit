@@ -29,8 +29,10 @@ export function failure(err: unknown) {
         : err.kind === "malformed"
           ? "The AI returned an unreadable response twice. Try again."
           : err.kind === "config"
-            ? "The AI gateway is not configured. Check AI_GATEWAY_API_KEY."
-            : err.message;
+            ? "The AI is not configured. Check ANTHROPIC_API_KEY."
+            : err.kind === "refusal"
+              ? "The model declined to process this text."
+              : err.message;
 
     return NextResponse.json<ApiError>(
       { error: message },

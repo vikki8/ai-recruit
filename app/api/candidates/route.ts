@@ -75,7 +75,11 @@ export async function POST(req: Request) {
     // recruiter can see and retry, instead of the request vanishing.
     if (candidateId) {
       const message = err instanceof Error ? err.message : "Evaluation failed.";
-      await setCandidateStatus(candidateId, "error", message.slice(0, 300)).catch(() => {});
+      try {
+        await setCandidateStatus(candidateId, "error", message.slice(0, 300));
+      } catch {
+        // The original failure is the one worth reporting; do not mask it.
+      }
     }
     return failure(err);
   }
